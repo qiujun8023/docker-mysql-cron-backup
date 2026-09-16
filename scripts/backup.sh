@@ -271,8 +271,10 @@ while IFS= read -r database || [[ -n "$database" ]]; do
 done < "$DATABASE_LIST"
 
 if (( ${#DATABASES[@]} == 0 )); then
-  fail "no user databases found"
-  exit 1
+  write_epoch "$STATE_DIR/last-success"
+  rm -f "$STATE_DIR/last-failure"
+  log "No user databases found; nothing to back up"
+  exit 0
 fi
 
 log "Starting backup; databases=${#DATABASES[@]}"

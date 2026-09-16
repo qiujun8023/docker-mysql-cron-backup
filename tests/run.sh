@@ -101,6 +101,23 @@ test_happy_path() {
   pass "$name"
 }
 
+test_no_user_databases() {
+  local name=no_user_databases
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  run_backup "$root" MOCK_DATABASES='information_schema\nmysql\nperformance_schema\nsys\n'
+
+  assert_file "$root/state/last-success" "$name"
+  [[ ! -e "$root/state/last-failure" ]] \
+    || fail_test "$name" "failure marker exists after successful no-op"
+  [[ ! -e "$root/aws.log" ]] \
+    || fail_test "$name" "aws should not be called"
+  assert_empty_dir "$root/s3" "$name"
+  assert_empty_dir "$root/tmp" "$name"
+  pass "$name"
+}
+
 test_s3_prefix() {
   local name=s3_prefix
   local root="$TEST_ROOT/$name"
@@ -290,6 +307,7 @@ test_healthcheck() {
 }
 
 test_happy_path
+test_no_user_databases
 test_s3_prefix
 test_invalid_s3_prefix
 test_without_endpoint

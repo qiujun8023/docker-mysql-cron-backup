@@ -1,7 +1,6 @@
 services:
   mysql-backup:
     image: ghcr.io/qiujun8023/mysql-cron-backup:latest
-    pull_policy: always
     restart: unless-stopped
     environment:
       - MYSQL_HOST=mysql

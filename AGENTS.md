@@ -8,6 +8,7 @@
 - 镜像基于 MySQL 8.4，使用官方 `mysql` 和 `mysqldump` 客户端。
 - BusyBox `crond` 根据 `BACKUP_CRON` 运行备份任务。
 - 备份在容器临时目录生成，完成 gzip 校验和 S3 上传校验后清理。
+- 成功连接 MySQL 但没有业务数据库时，任务以成功状态结束。
 - 对象键格式为 `[<S3_PREFIX>/]<数据库名>.<YYYYMMDDHHmmss>.sql.gz`。
 - 备份保留周期由对象存储生命周期规则管理。
 - `/var/lib/mysql-backup` 保存任务状态，供 Docker Healthcheck 使用。
