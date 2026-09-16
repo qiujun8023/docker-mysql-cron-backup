@@ -1,0 +1,42 @@
+services:
+  mysql-scheduled-backup:
+    image: ghcr.io/qiujun8023/mysql-scheduled-backup:latest
+    container_name: database-mysql-backup
+    restart: unless-stopped
+    networks:
+      - database
+    volumes:
+      - ./mysql-backup:/backup
+    environment:
+      BACKUP_SERVER_NAME: tencent-tky-001
+      BACKUP_TIME: "01:30"
+      LOCAL_RETENTION_COUNT: "2"
+      RUN_ON_STARTUP: "false"
+      MYSQL_HOST: mysql
+      MYSQL_USER_FILE: /run/secrets/mysql_backup_user
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_backup_password
+      AWS_ACCESS_KEY_ID_FILE: /run/secrets/rustfs_access_key
+      AWS_SECRET_ACCESS_KEY_FILE: /run/secrets/rustfs_secret_key
+      S3_ENDPOINT: https://s3.qiujun.xyz
+      S3_BUCKET: mysql-backups
+      S3_REGION: us-east-1
+      TZ: Asia/Shanghai
+    secrets:
+      - mysql_backup_user
+      - mysql_backup_password
+      - rustfs_access_key
+      - rustfs_secret_key
+
+secrets:
+  mysql_backup_user:
+    file: ./secrets/mysql_backup_user
+  mysql_backup_password:
+    file: ./secrets/mysql_backup_password
+  rustfs_access_key:
+    file: ./secrets/rustfs_access_key
+  rustfs_secret_key:
+    file: ./secrets/rustfs_secret_key
+
+networks:
+  database:
+    external: true
