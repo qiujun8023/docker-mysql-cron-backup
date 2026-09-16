@@ -25,7 +25,7 @@ CROND_BIN="${CROND_BIN:-crond}"
 crond_pid=""
 
 # Invoked by the signal trap below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 stop() {
   if [[ -n "$crond_pid" ]]; then
     kill "$crond_pid" 2>/dev/null || true
