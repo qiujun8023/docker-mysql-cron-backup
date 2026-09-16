@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - master
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -28,8 +26,16 @@ jobs:
       - name: Run tests
         run: bash tests/run.sh
 
-  build:
+  integration:
     needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run integration tests
+        run: bash tests/integration.sh
+
+  build:
+    needs: integration
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,23 +48,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
       - name: Build and publish
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ghcr.io/qiujun8023/mysql-cron-backup:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

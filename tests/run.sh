@@ -4,7 +4,8 @@ set -Eeuo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_SCRIPT="$PROJECT_ROOT/scripts/backup.sh"
-TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mysql-scheduled-backup.XXXXXX")"
+ENTRYPOINT_SCRIPT="$PROJECT_ROOT/scripts/entrypoint.sh"
+TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/docker-mysql-cron-backup.XXXXXX")"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 pass_count=0
@@ -23,15 +24,21 @@ assert_file() {
   [[ -f "$1" ]] || fail_test "$2" "missing file $1"
 }
 
+assert_empty_dir() {
+  if [[ -n "$(find "$1" -mindepth 1 -print -quit)" ]]; then
+    fail_test "$2" "directory is not empty: $1"
+  fi
+}
+
 assert_no_match() {
-  if find "$1" -type f -name "$2" | grep -q .; then
+  if [[ -n "$(find "$1" -type f -name "$2" -print -quit)" ]]; then
     fail_test "$3" "unexpected file matching $2"
   fi
 }
 
 create_mocks() {
   local root="$1"
-  mkdir -p "$root/bin" "$root/s3"
+  mkdir -p "$root/bin" "$root/s3" "$root/state" "$root/tmp"
 
   cat > "$root/bin/mysql" <<'MOCK'
 #!/usr/bin/env bash
@@ -47,48 +54,7 @@ fi
 printf '%s\n' "CREATE DATABASE IF NOT EXISTS \`$database\`;" "USE \`$database\`;" "SELECT '$database';"
 MOCK
 
-  cat > "$root/bin/aws" <<'MOCK'
-#!/usr/bin/env bash
-set -euo pipefail
-args=("$@")
-index=0
-while (( index < ${#args[@]} )); do
-  case "${args[$index]}" in
-    s3|s3api) break ;;
-  esac
-  index=$((index + 1))
-done
-command="${args[$index]:-}"
-if [[ "$command" == "s3" && "${args[$((index + 1))]:-}" == "cp" ]]; then
-  source_file="${args[$((index + 2))]}"
-  uri="${args[$((index + 3))]}"
-  object="${uri#s3://}"
-  key="${object#*/}"
-  destination="$MOCK_S3_DIR/$key"
-  mkdir -p "$(dirname "$destination")"
-  cp "$source_file" "$destination"
-  printf '%s\n' "$key" >> "$MOCK_AWS_LOG"
-  exit 0
-fi
-if [[ "$command" == "s3api" && "${args[$((index + 1))]:-}" == "head-object" ]]; then
-  key=""
-  index=$((index + 2))
-  while (( index < ${#args[@]} )); do
-    if [[ "${args[$index]}" == "--key" ]]; then
-      key="${args[$((index + 1))]}"
-      break
-    fi
-    index=$((index + 1))
-  done
-  size="$(wc -c < "$MOCK_S3_DIR/$key" | tr -d '[:space:]')"
-  if [[ "${MOCK_SIZE_MISMATCH:-false}" == "true" ]]; then
-    size=$((size + 1))
-  fi
-  printf '%s\n' "$size"
-  exit 0
-fi
-exit 64
-MOCK
+  cp "$PROJECT_ROOT/tests/fake-aws.sh" "$root/bin/aws"
 
   chmod +x "$root/bin/mysql" "$root/bin/mysqldump" "$root/bin/aws"
 }
@@ -98,20 +64,20 @@ run_backup() {
   shift
   env \
     PATH="$root/bin:$PATH" \
-    BACKUP_DIR="$root/backup" \
+    TMPDIR="$root/tmp" \
+    STATE_DIR="$root/state" \
     BACKUP_LOCK_DISABLED=true \
-    BACKUP_SERVER_NAME=tencent-tky-001 \
     BACKUP_TIMESTAMP=20260917013000 \
-    LOCAL_RETENTION_COUNT=2 \
     MYSQL_HOST=mysql \
     MYSQL_USER=backup \
     MYSQL_PASSWORD=secret \
-    AWS_ACCESS_KEY_ID=mysql-backup \
+    S3_ENDPOINT=https://s3.example.test \
+    S3_BUCKET=mysql-backups \
+    AWS_ACCESS_KEY_ID=access \
     AWS_SECRET_ACCESS_KEY=secret \
     MOCK_AWS_LOG="$root/aws.log" \
+    MOCK_AWS_ARGS_LOG="$root/aws-args.log" \
     MOCK_S3_DIR="$root/s3" \
-    S3_BUCKET=mysql-backups \
-    S3_ENDPOINT=https://s3.example.test \
     "$@" \
     bash "$BACKUP_SCRIPT"
 }
@@ -120,37 +86,55 @@ test_happy_path() {
   local name=happy_path
   local root="$TEST_ROOT/$name"
   create_mocks "$root"
-  mkdir -p "$root/backup"
 
   run_backup "$root"
 
-  assert_file "$root/backup/app.20260917013000.sql.gz" "$name"
-  assert_file "$root/backup/analytics.20260917013000.sql.gz" "$name"
-  assert_file "$root/s3/tencent-tky-001/app.20260917013000.sql.gz" "$name"
-  assert_file "$root/s3/tencent-tky-001/analytics.20260917013000.sql.gz" "$name"
-  assert_file "$root/backup/.state/last-success" "$name"
-  assert_no_match "$root" 'latest.*' "$name"
+  assert_file "$root/s3/app.20260917013000.sql.gz" "$name"
+  assert_file "$root/s3/analytics.20260917013000.sql.gz" "$name"
+  assert_file "$root/state/last-success" "$name"
   assert_no_match "$root/s3" 'mysql.*.sql.gz' "$name"
+  assert_empty_dir "$root/tmp" "$name"
+  gzip -dc "$root/s3/app.20260917013000.sql.gz" | head -n 1 | grep -q '^CREATE DATABASE' \
+    || fail_test "$name" "unexpected dump content"
+  grep -q -- '--endpoint-url https://s3.example.test' "$root/aws-args.log" \
+    || fail_test "$name" "endpoint was not passed to aws"
   pass "$name"
 }
 
-test_local_retention() {
-  local name=local_retention
+test_s3_prefix() {
+  local name=s3_prefix
   local root="$TEST_ROOT/$name"
   create_mocks "$root"
-  mkdir -p "$root/backup"
-  printf old | gzip -n > "$root/backup/app.20260914013000.sql.gz"
-  printf old | gzip -n > "$root/backup/app.20260915013000.sql.gz"
-  printf old | gzip -n > "$root/backup/app.20260916013000.sql.gz"
 
-  run_backup "$root" MYSQL_DATABASES=app
+  run_backup "$root" MYSQL_DATABASES=app S3_PREFIX=/prod/db-01/
 
-  [[ "$(find "$root/backup" -maxdepth 1 -name 'app.*.sql.gz' | wc -l | tr -d '[:space:]')" == 2 ]] \
-    || fail_test "$name" "expected two local backups"
-  [[ ! -e "$root/backup/app.20260915013000.sql.gz" ]] \
-    || fail_test "$name" "old backup was not removed"
-  assert_file "$root/backup/app.20260916013000.sql.gz" "$name"
-  assert_file "$root/backup/app.20260917013000.sql.gz" "$name"
+  assert_file "$root/s3/prod/db-01/app.20260917013000.sql.gz" "$name"
+  pass "$name"
+}
+
+test_invalid_s3_prefix() {
+  local name=invalid_s3_prefix
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  if run_backup "$root" MYSQL_DATABASES=app S3_PREFIX='a//b'; then
+    fail_test "$name" "backup unexpectedly succeeded"
+  fi
+
+  assert_file "$root/state/last-failure" "$name"
+  pass "$name"
+}
+
+test_without_endpoint() {
+  local name=without_endpoint
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  run_backup "$root" MYSQL_DATABASES=app S3_ENDPOINT=
+
+  if grep -q -- '--endpoint-url' "$root/aws-args.log"; then
+    fail_test "$name" "endpoint should not be passed to aws"
+  fi
   pass "$name"
 }
 
@@ -158,17 +142,31 @@ test_partial_failure() {
   local name=partial_failure
   local root="$TEST_ROOT/$name"
   create_mocks "$root"
-  mkdir -p "$root/backup"
 
   if run_backup "$root" MYSQL_DATABASES=app,broken MOCK_FAIL_DATABASE=broken; then
     fail_test "$name" "backup unexpectedly succeeded"
   fi
 
-  assert_file "$root/s3/tencent-tky-001/app.20260917013000.sql.gz" "$name"
-  assert_file "$root/backup/.state/last-failure" "$name"
-  [[ ! -e "$root/backup/.state/last-success" ]] \
+  assert_file "$root/s3/app.20260917013000.sql.gz" "$name"
+  assert_file "$root/state/last-failure" "$name"
+  [[ ! -e "$root/state/last-success" ]] \
     || fail_test "$name" "success marker exists after failure"
-  assert_no_match "$root/backup" '.*.partial' "$name"
+  assert_no_match "$root/s3" 'broken.*' "$name"
+  assert_empty_dir "$root/tmp" "$name"
+  pass "$name"
+}
+
+test_unsupported_database_name() {
+  local name=unsupported_database_name
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  if run_backup "$root" MOCK_DATABASES='app\nbad name\n'; then
+    fail_test "$name" "backup unexpectedly succeeded"
+  fi
+
+  assert_file "$root/s3/app.20260917013000.sql.gz" "$name"
+  assert_file "$root/state/last-failure" "$name"
   pass "$name"
 }
 
@@ -176,13 +174,92 @@ test_remote_size_mismatch() {
   local name=remote_size_mismatch
   local root="$TEST_ROOT/$name"
   create_mocks "$root"
-  mkdir -p "$root/backup"
 
   if run_backup "$root" MYSQL_DATABASES=app MOCK_SIZE_MISMATCH=true; then
     fail_test "$name" "backup unexpectedly succeeded"
   fi
 
-  assert_file "$root/backup/.state/last-failure" "$name"
+  assert_file "$root/state/last-failure" "$name"
+  assert_empty_dir "$root/tmp" "$name"
+  pass "$name"
+}
+
+test_missing_bucket() {
+  local name=missing_bucket
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  if run_backup "$root" MYSQL_DATABASES=app S3_BUCKET=; then
+    fail_test "$name" "backup unexpectedly succeeded"
+  fi
+
+  [[ ! -e "$root/aws.log" ]] || fail_test "$name" "aws should not be called"
+  pass "$name"
+}
+
+test_invalid_ssl_mode() {
+  local name=invalid_ssl_mode
+  local root="$TEST_ROOT/$name"
+  create_mocks "$root"
+
+  if run_backup "$root" MYSQL_DATABASES=app MYSQL_SSL_MODE=INVALID; then
+    fail_test "$name" "backup unexpectedly succeeded"
+  fi
+
+  [[ ! -e "$root/aws.log" ]] || fail_test "$name" "aws should not be called"
+  pass "$name"
+}
+
+run_entrypoint() {
+  local root="$1"
+  shift
+  env \
+    STATE_DIR="$root/state" \
+    CRON_DIR="$root/crontabs" \
+    CROND_BIN="$root/bin/crond" \
+    "$@" \
+    bash "$ENTRYPOINT_SCRIPT"
+}
+
+create_crond_mock() {
+  local root="$1"
+  mkdir -p "$root/bin"
+  cat > "$root/bin/crond" <<MOCK
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" > "$root/crond.args"
+MOCK
+  chmod +x "$root/bin/crond"
+}
+
+test_entrypoint_crontab() {
+  local name=entrypoint_crontab
+  local root="$TEST_ROOT/$name"
+  create_crond_mock "$root"
+
+  run_entrypoint "$root" BACKUP_CRON='*/15 1-5 * * 1,3'
+
+  [[ "$(cat "$root/crontabs/root")" == '*/15 1-5 * * 1,3 /usr/local/bin/backup.sh >/proc/1/fd/1 2>/proc/1/fd/2' ]] \
+    || fail_test "$name" "unexpected crontab: $(cat "$root/crontabs/root")"
+  [[ "$(cat "$root/crond.args")" == "-f -l 8 -L /dev/stderr -c $root/crontabs" ]] \
+    || fail_test "$name" "unexpected crond args: $(cat "$root/crond.args")"
+  assert_file "$root/state/started-at" "$name"
+  pass "$name"
+}
+
+test_entrypoint_invalid_cron() {
+  local name=entrypoint_invalid_cron
+  local root="$TEST_ROOT/$name"
+  local expression
+  create_crond_mock "$root"
+
+  for expression in '0 3 * *' '0 3 * * * *' $'0 3 * * *\n* * * * *' '0 3 * * ;id'; do
+    if run_entrypoint "$root" BACKUP_CRON="$expression" 2>/dev/null; then
+      fail_test "$name" "accepted invalid expression: $expression"
+    fi
+  done
+
+  [[ ! -e "$root/crond.args" ]] || fail_test "$name" "crond should not start"
+  [[ ! -e "$root/crontabs/root" ]] || fail_test "$name" "crontab should not be written"
   pass "$name"
 }
 
@@ -190,58 +267,39 @@ test_healthcheck() {
   local name=healthcheck
   local root="$TEST_ROOT/$name"
   local now
-  mkdir -p "$root/backup/.state"
+  mkdir -p "$root/state"
   now="$(date +%s)"
 
-  printf '%s\n' "$now" > "$root/backup/.state/started-at"
-  BACKUP_DIR="$root/backup" HEALTHCHECK_MAX_AGE_SECONDS=60 \
+  printf '%s\n' "$now" > "$root/state/started-at"
+  STATE_DIR="$root/state" HEALTHCHECK_MAX_AGE_SECONDS=60 \
     bash "$PROJECT_ROOT/scripts/healthcheck.sh" \
     || fail_test "$name" "fresh container should be healthy"
 
-  printf '%s\n' "$now" > "$root/backup/.state/last-success"
-  printf '%s\n' "$((now + 1))" > "$root/backup/.state/last-failure"
-  if BACKUP_DIR="$root/backup" HEALTHCHECK_MAX_AGE_SECONDS=60 \
+  printf '%s\n' "$now" > "$root/state/last-success"
+  printf '%s\n' "$((now + 1))" > "$root/state/last-failure"
+  if STATE_DIR="$root/state" HEALTHCHECK_MAX_AGE_SECONDS=60 \
       bash "$PROJECT_ROOT/scripts/healthcheck.sh"; then
     fail_test "$name" "newer failure should be unhealthy"
   fi
 
-  printf '%s\n' "$((now + 2))" > "$root/backup/.state/last-success"
-  BACKUP_DIR="$root/backup" HEALTHCHECK_MAX_AGE_SECONDS=60 \
+  printf '%s\n' "$((now + 2))" > "$root/state/last-success"
+  STATE_DIR="$root/state" HEALTHCHECK_MAX_AGE_SECONDS=60 \
     bash "$PROJECT_ROOT/scripts/healthcheck.sh" \
     || fail_test "$name" "newer success should recover health"
   pass "$name"
 }
 
-test_file_credentials() {
-  local name=file_credentials
-  local root="$TEST_ROOT/$name"
-  create_mocks "$root"
-  mkdir -p "$root/backup" "$root/secrets"
-  printf '%s\n' backup > "$root/secrets/mysql_user"
-  printf '%s\n' mysql-secret > "$root/secrets/mysql_password"
-  printf '%s\n' mysql-backup > "$root/secrets/s3_access_key"
-  printf '%s\n' s3-secret > "$root/secrets/s3_secret_key"
-
-  run_backup "$root" \
-    MYSQL_DATABASES=app \
-    MYSQL_USER= \
-    MYSQL_USER_FILE="$root/secrets/mysql_user" \
-    MYSQL_PASSWORD= \
-    MYSQL_PASSWORD_FILE="$root/secrets/mysql_password" \
-    AWS_ACCESS_KEY_ID= \
-    AWS_ACCESS_KEY_ID_FILE="$root/secrets/s3_access_key" \
-    AWS_SECRET_ACCESS_KEY= \
-    AWS_SECRET_ACCESS_KEY_FILE="$root/secrets/s3_secret_key"
-
-  assert_file "$root/s3/tencent-tky-001/app.20260917013000.sql.gz" "$name"
-  pass "$name"
-}
-
 test_happy_path
-test_local_retention
+test_s3_prefix
+test_invalid_s3_prefix
+test_without_endpoint
 test_partial_failure
+test_unsupported_database_name
 test_remote_size_mismatch
+test_missing_bucket
+test_invalid_ssl_mode
+test_entrypoint_crontab
+test_entrypoint_invalid_cron
 test_healthcheck
-test_file_credentials
 
 printf '%s tests passed\n' "$pass_count"

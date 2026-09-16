@@ -2,9 +2,8 @@
 
 set -uo pipefail
 
-BACKUP_DIR="${BACKUP_DIR:-/backup}"
 MAX_AGE="${HEALTHCHECK_MAX_AGE_SECONDS:-129600}"
-STATE_DIR="$BACKUP_DIR/.state"
+STATE_DIR="${STATE_DIR:-/var/lib/mysql-backup}"
 
 read_epoch() {
   local file="$1"

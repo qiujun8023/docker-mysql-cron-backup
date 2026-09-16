@@ -14,30 +14,6 @@ fail() {
   return 1
 }
 
-read_setting() {
-  local value_name="$1"
-  local file_name="$2"
-  local value="${!value_name:-}"
-  local file="${!file_name:-}"
-
-  if [[ -n "$value" && -n "$file" ]]; then
-    fail "set either $value_name or $file_name, not both"
-    return 1
-  fi
-
-  if [[ -n "$file" ]]; then
-    if [[ ! -r "$file" ]]; then
-      fail "$file_name is not readable: $file"
-      return 1
-    fi
-    IFS= read -r value < "$file" || true
-    value="${value%$'\r'}"
-  fi
-
-  printf -v "$value_name" '%s' "$value"
-  export "${value_name?}"
-}
-
 require_value() {
   local name="$1"
   if [[ -z "${!name:-}" ]]; then
@@ -82,38 +58,9 @@ local_file_size() {
   wc -c < "$1" | tr -d '[:space:]'
 }
 
-cleanup_local_backups() {
-  local database="$1"
-  local keep="$2"
-  local files=()
-  local file
-
-  while IFS= read -r file; do
-    files+=("$file")
-  done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name "${database}.*.sql.gz" -print | sort)
-
-  while (( ${#files[@]} > keep )); do
-    log "Removing local backup ${files[0]}"
-    if ! rm -f -- "${files[0]}"; then
-      fail "could not remove local backup ${files[0]}"
-      return 1
-    fi
-    files=("${files[@]:1}")
-  done
-}
-
 collect_databases() {
   local destination="$1"
   local query
-
-  if [[ -n "${MYSQL_DATABASES_FILE:-}" ]]; then
-    if [[ ! -r "$MYSQL_DATABASES_FILE" ]]; then
-      fail "MYSQL_DATABASES_FILE is not readable: $MYSQL_DATABASES_FILE"
-      return 1
-    fi
-    cp "$MYSQL_DATABASES_FILE" "$destination"
-    return
-  fi
 
   if [[ -n "${MYSQL_DATABASES:-}" ]]; then
     printf '%s\n' "$MYSQL_DATABASES" | tr ',' '\n' > "$destination"
@@ -131,18 +78,11 @@ backup_database() {
   local database="$1"
   local timestamp="$2"
   local basename="${database}.${timestamp}.sql.gz"
-  local destination="${BACKUP_DIR}/${basename}"
-  local temporary="${BACKUP_DIR}/.${basename}.partial"
-  local key="${BACKUP_SERVER_NAME}/${basename}"
+  local dump_file="${WORK_DIR}/${basename}"
+  local key="${S3_KEY_PREFIX}${basename}"
   local remote_size
   local local_size
 
-  if [[ -e "$destination" || -e "$temporary" ]]; then
-    fail "backup already exists for $database at timestamp $timestamp"
-    return 1
-  fi
-
-  CURRENT_PARTIAL="$temporary"
   log "Dumping database $database"
   if ! "$MYSQLDUMP_BIN" \
       "${MYSQL_CONNECTION_ARGS[@]}" \
@@ -155,37 +95,30 @@ backup_database() {
       --no-tablespaces \
       --set-gtid-purged=OFF \
       --databases "$database" \
-      | gzip "-$GZIP_LEVEL" -n > "$temporary"; then
-    rm -f -- "$temporary"
-    CURRENT_PARTIAL=""
+      | gzip "-$GZIP_LEVEL" -n > "$dump_file"; then
+    rm -f -- "$dump_file"
     fail "mysqldump failed for $database"
     return 1
   fi
 
-  if ! gzip -t "$temporary"; then
-    rm -f -- "$temporary"
-    CURRENT_PARTIAL=""
+  if ! gzip -t "$dump_file"; then
+    rm -f -- "$dump_file"
     fail "gzip verification failed for $database"
     return 1
   fi
 
-  if ! mv "$temporary" "$destination"; then
-    rm -f -- "$temporary"
-    CURRENT_PARTIAL=""
-    fail "could not finalize local backup for $database"
-    return 1
-  fi
-  CURRENT_PARTIAL=""
   log "Uploading s3://${S3_BUCKET}/${key}"
-
   if ! "$AWS_BIN" "${AWS_ARGS[@]}" s3 cp \
-      "$destination" "s3://${S3_BUCKET}/${key}" \
+      "$dump_file" "s3://${S3_BUCKET}/${key}" \
       --only-show-errors; then
+    rm -f -- "$dump_file"
     fail "S3 upload failed for $database"
     return 1
   fi
 
-  local_size="$(local_file_size "$destination")"
+  local_size="$(local_file_size "$dump_file")"
+  rm -f -- "$dump_file"
+
   if ! remote_size="$("$AWS_BIN" "${AWS_ARGS[@]}" s3api head-object \
       --bucket "$S3_BUCKET" \
       --key "$key" \
@@ -201,36 +134,34 @@ backup_database() {
     return 1
   fi
 
-  cleanup_local_backups "$database" "$LOCAL_RETENTION_COUNT"
   log "Completed database $database"
 }
 
-BACKUP_DIR="${BACKUP_DIR:-/backup}"
-BACKUP_SERVER_NAME="${BACKUP_SERVER_NAME:-}"
+MYSQL_HOST="${MYSQL_HOST:-mysql}"
+MYSQL_PORT="${MYSQL_PORT:-3306}"
+MYSQL_USER="${MYSQL_USER:-}"
+MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
+MYSQL_SSL_MODE="${MYSQL_SSL_MODE:-PREFERRED}"
+S3_ENDPOINT="${S3_ENDPOINT:-}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_BUCKET="${S3_BUCKET:-}"
+S3_PREFIX="${S3_PREFIX:-}"
+AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 GZIP_LEVEL="${GZIP_LEVEL:-6}"
-LOCAL_RETENTION_COUNT="${LOCAL_RETENTION_COUNT:-2}"
+STATE_DIR="${STATE_DIR:-/var/lib/mysql-backup}"
 MYSQL_BIN="${MYSQL_BIN:-mysql}"
 MYSQLDUMP_BIN="${MYSQLDUMP_BIN:-mysqldump}"
-MYSQL_HOST="${MYSQL_HOST:-}"
-MYSQL_PORT="${MYSQL_PORT:-3306}"
-MYSQL_SSL_MODE="${MYSQL_SSL_MODE:-PREFERRED}"
 AWS_BIN="${AWS_BIN:-aws}"
-S3_BUCKET="${S3_BUCKET:-mysql-backups}"
-S3_REGION="${S3_REGION:-us-east-1}"
 
-mkdir -p "$BACKUP_DIR/.state"
-STATE_DIR="$BACKUP_DIR/.state"
-CURRENT_PARTIAL=""
-DATABASE_LIST=""
+mkdir -p "$STATE_DIR"
+WORK_DIR=""
 
 on_exit() {
   local status=$?
   trap - EXIT
-  if [[ -n "$CURRENT_PARTIAL" ]]; then
-    rm -f -- "$CURRENT_PARTIAL" 2>/dev/null || true
-  fi
-  if [[ -n "$DATABASE_LIST" ]]; then
-    rm -f -- "$DATABASE_LIST" 2>/dev/null || true
+  if [[ -n "$WORK_DIR" ]]; then
+    rm -rf -- "$WORK_DIR" 2>/dev/null || true
   fi
   if (( status != 0 )); then
     write_epoch "$STATE_DIR/last-failure" 2>/dev/null || true
@@ -239,28 +170,20 @@ on_exit() {
 }
 trap on_exit EXIT
 
-read_setting MYSQL_HOST MYSQL_HOST_FILE
-read_setting MYSQL_USER MYSQL_USER_FILE
-read_setting MYSQL_PASSWORD MYSQL_PASSWORD_FILE
-read_setting AWS_ACCESS_KEY_ID AWS_ACCESS_KEY_ID_FILE
-read_setting AWS_SECRET_ACCESS_KEY AWS_SECRET_ACCESS_KEY_FILE
-
-MYSQL_HOST="${MYSQL_HOST:-mysql}"
-export MYSQL_HOST
-
-require_value BACKUP_SERVER_NAME
-require_value MYSQL_HOST
 require_value MYSQL_USER
 require_value MYSQL_PASSWORD
 require_value S3_BUCKET
-require_value S3_ENDPOINT
 require_value AWS_ACCESS_KEY_ID
 require_value AWS_SECRET_ACCESS_KEY
 
-if [[ ! "$BACKUP_SERVER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-  fail "BACKUP_SERVER_NAME contains unsupported characters"
+S3_PREFIX="${S3_PREFIX#/}"
+S3_PREFIX="${S3_PREFIX%/}"
+if [[ -n "$S3_PREFIX" && ! "$S3_PREFIX" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]]; then
+  fail "S3_PREFIX contains unsupported characters"
   exit 1
 fi
+S3_KEY_PREFIX="${S3_PREFIX:+${S3_PREFIX}/}"
+
 if [[ ! "$MYSQL_PORT" =~ ^[0-9]+$ ]]; then
   fail "MYSQL_PORT must be numeric"
   exit 1
@@ -269,10 +192,13 @@ if [[ ! "$GZIP_LEVEL" =~ ^[1-9]$ ]]; then
   fail "GZIP_LEVEL must be between 1 and 9"
   exit 1
 fi
-if [[ ! "$LOCAL_RETENTION_COUNT" =~ ^[1-9][0-9]*$ ]]; then
-  fail "LOCAL_RETENTION_COUNT must be a positive integer"
-  exit 1
-fi
+case "$MYSQL_SSL_MODE" in
+  DISABLED|PREFERRED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY) ;;
+  *)
+    fail "MYSQL_SSL_MODE must be DISABLED, PREFERRED, REQUIRED, VERIFY_CA or VERIFY_IDENTITY"
+    exit 1
+    ;;
+esac
 
 require_command "$MYSQL_BIN"
 require_command "$MYSQLDUMP_BIN"
@@ -289,14 +215,22 @@ if [[ "${BACKUP_LOCK_DISABLED:-false}" != "true" ]]; then
 fi
 write_epoch "$STATE_DIR/last-attempt"
 
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mysql-backup.XXXXXX")"
+
 export MYSQL_PWD="$MYSQL_PASSWORD"
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 export AWS_DEFAULT_REGION="$S3_REGION"
 
 if [[ -z "${AWS_CONFIG_FILE:-}" ]]; then
-  AWS_CONFIG_FILE="$STATE_DIR/aws-config"
-  printf '[default]\nregion = %s\ns3 =\n  addressing_style = path\n' "$S3_REGION" > "$AWS_CONFIG_FILE"
-  chmod 0600 "$AWS_CONFIG_FILE"
+  AWS_CONFIG_FILE="$WORK_DIR/aws-config"
+  {
+    printf '[default]\nregion = %s\n' "$S3_REGION"
+    if [[ -n "$S3_ENDPOINT" ]]; then
+      printf 'request_checksum_calculation = when_required\n'
+      printf 'response_checksum_validation = when_required\n'
+      printf 's3 =\n  addressing_style = path\n'
+    fi
+  } > "$AWS_CONFIG_FILE"
   export AWS_CONFIG_FILE
 fi
 
@@ -308,7 +242,10 @@ MYSQL_CONNECTION_ARGS=(
   --ssl-mode="$MYSQL_SSL_MODE"
 )
 MYSQL_ARGS=("${MYSQL_CONNECTION_ARGS[@]}" --batch --skip-column-names)
-AWS_ARGS=(--endpoint-url "$S3_ENDPOINT" --region "$S3_REGION")
+AWS_ARGS=(--region "$S3_REGION")
+if [[ -n "$S3_ENDPOINT" ]]; then
+  AWS_ARGS+=(--endpoint-url "$S3_ENDPOINT")
+fi
 
 TIMESTAMP="${BACKUP_TIMESTAMP:-$(date +%Y%m%d%H%M%S)}"
 if [[ ! "$TIMESTAMP" =~ ^[0-9]{14}$ ]]; then
@@ -316,34 +253,29 @@ if [[ ! "$TIMESTAMP" =~ ^[0-9]{14}$ ]]; then
   exit 1
 fi
 
-DATABASE_LIST="$STATE_DIR/databases.$$"
-if ! collect_databases "$DATABASE_LIST"; then
-  rm -f "$DATABASE_LIST"
-  DATABASE_LIST=""
-  exit 1
-fi
+DATABASE_LIST="$WORK_DIR/databases"
+collect_databases "$DATABASE_LIST"
 
+failures=0
 DATABASES=()
 while IFS= read -r database || [[ -n "$database" ]]; do
   database="$(trim "${database%$'\r'}")"
-  [[ -z "$database" || "$database" == \#* ]] && continue
+  [[ -z "$database" ]] && continue
   is_system_database "$database" && continue
   if ! validate_database_name "$database"; then
-    fail "unsupported database name: $database"
-    exit 1
+    log "ERROR: skipping unsupported database name: $database" >&2
+    failures=$((failures + 1))
+    continue
   fi
   DATABASES+=("$database")
 done < "$DATABASE_LIST"
-rm -f "$DATABASE_LIST"
-DATABASE_LIST=""
 
 if (( ${#DATABASES[@]} == 0 )); then
   fail "no user databases found"
   exit 1
 fi
 
-log "Starting backup for ${BACKUP_SERVER_NAME}; databases=${#DATABASES[@]}"
-failures=0
+log "Starting backup; databases=${#DATABASES[@]}"
 for database in "${DATABASES[@]}"; do
   if ! backup_database "$database" "$TIMESTAMP"; then
     failures=$((failures + 1))
